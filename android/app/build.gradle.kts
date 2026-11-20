@@ -1,4 +1,4 @@
-﻿import java.io.FileInputStream
+import java.io.FileInputStream
 import java.util.Properties
 
 plugins {
@@ -83,6 +83,10 @@ android {
             if (releaseSigningAvailable) {
                 signingConfig = signingConfigs.getByName("release")
             }
+        }
+        // Local only: let the debug build sit next to the official app.
+        debug {
+            applicationIdSuffix = ".kai"
         }
     }
 }
