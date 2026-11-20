@@ -1,4 +1,4 @@
-import java.io.FileInputStream
+﻿import java.io.FileInputStream
 import java.util.Properties
 
 plugins {
@@ -57,13 +57,15 @@ android {
     }
 
     defaultConfig {
-        applicationId = "app.yahagi.kancollebrowser"
+        // Distinct id so this build can sit next to the official app.
+        applicationId = "app.yahagi.kancollebrowser.kai"
+        // Pinned so a sideloaded build has a stable, comparable version.
+        versionCode = 49
+        versionName = "1.10.0-beta.9-kai"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
-        versionCode = flutter.versionCode
-        versionName = flutter.versionName
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -84,10 +86,6 @@ android {
                 signingConfig = signingConfigs.getByName("release")
             }
         }
-        // Local only: let the debug build sit next to the official app.
-        debug {
-            applicationIdSuffix = ".kai"
-        }
     }
 }
 
@@ -100,3 +98,5 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+
