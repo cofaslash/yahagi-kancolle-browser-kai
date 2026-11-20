@@ -3,6 +3,7 @@ package app.yahagi.kancollebrowser.browser
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -82,7 +83,8 @@ class GameResourceCacheEngineTest {
 
     @Test
     fun `download slot queue wait consumes the request budget`() {
-        val entered = CountDownLatch(2)
+        val max = GameResourceCacheEngine.MAX_CONCURRENT_DOWNLOADS
+        val entered = CountDownLatch(max)
         val release = CountDownLatch(1)
         val fetcher = object : GameResourceFetcher {
             override fun budgetMillis(url: String) = 80L
@@ -93,11 +95,12 @@ class GameResourceCacheEngineTest {
             }
         }
         val engine = engine(fetcher)
-        val urls = (0..100).map { official("/kcs2/resources/$it.png?v=1") }
-            .distinctBy { (checkNotNull(GameResourceCacheKey.from(it)).hashCode() and Int.MAX_VALUE) % 64 }.take(3)
-        val executor = Executors.newFixedThreadPool(3)
+        val urls = (0..500).map { official("/kcs2/resources/$it.png?v=1") }
+            .distinctBy { (checkNotNull(GameResourceCacheKey.from(it)).hashCode() and Int.MAX_VALUE) % 64 }
+            .take(max + 1)
+        val executor = Executors.newFixedThreadPool(max + 1)
         try {
-            val active = urls.take(2).map { url -> executor.submit<GameResourceResponse?> { engine.fetch(url) } }
+            val active = urls.take(max).map { url -> executor.submit<GameResourceResponse?> { engine.fetch(url) } }
             assertTrue(entered.await(2, TimeUnit.SECONDS))
             val queued = executor.submit<GameResourceResponse?> { engine.fetch(urls.last(), waitForSlot = true) }
             assertNull(queued.get(300, TimeUnit.MILLISECONDS))
@@ -721,8 +724,9 @@ class GameResourceCacheEngineTest {
     }
 
     @Test
-    fun `at most two distinct cache misses download concurrently`() {
-        val started = CountDownLatch(2)
+    fun `at most the configured number of cache misses download concurrently`() {
+        val max = GameResourceCacheEngine.MAX_CONCURRENT_DOWNLOADS
+        val started = CountDownLatch(max)
         val release = CountDownLatch(1)
         val calls = AtomicInteger()
         val fetcher = GameResourceFetcher { _, _, _ ->
@@ -732,17 +736,19 @@ class GameResourceCacheEngineTest {
             result(byteArrayOf(7))
         }
         val engine = engine(fetcher)
-        val pool = Executors.newFixedThreadPool(2)
+        val pool = Executors.newFixedThreadPool(max)
         try {
-            val first = pool.submit<GameResourceResponse?> { engine.fetch(official("/kcs2/resources/a.png")) }
-            val second = pool.submit<GameResourceResponse?> { engine.fetch(official("/kcs2/resources/b.png")) }
+            val active = (0 until max).map { index ->
+                pool.submit<GameResourceResponse?> {
+                    engine.fetch(official("/kcs2/resources/$index.png?v=1"))
+                }
+            }
             assertTrue(started.await(5, TimeUnit.SECONDS))
 
-            assertNull(engine.fetch(official("/kcs2/resources/c.png")))
-            assertEquals(2, calls.get())
+            assertNull(engine.fetch(official("/kcs2/resources/overflow.png")))
+            assertEquals(max, calls.get())
             release.countDown()
-            assertEquals(1, first.get(5, TimeUnit.SECONDS)?.bytes?.size)
-            assertEquals(1, second.get(5, TimeUnit.SECONDS)?.bytes?.size)
+            active.forEach { assertEquals(1, it.get(5, TimeUnit.SECONDS)?.bytes?.size) }
         } finally {
             release.countDown()
             pool.shutdownNow()
@@ -952,6 +958,170 @@ class GameResourceCacheEngineTest {
             GameResourceInspectionState.VALID,
             engine.inspectMetadata(url, expectedLength = 2).state,
         )
+    }
+
+    @Test
+    fun `route namespace stores a no-store response the stock cache rejects`() {
+        val stored = result(byteArrayOf(1)).copy(headers = mapOf(
+            "Content-Type" to "image/png",
+            "Content-Length" to "1",
+            "Cache-Control" to "no-store, no-cache, must-revalidate, max-age=0",
+        ))
+        val fetcher = QueueFetcher(stored, stored)
+        val engine = engine(fetcher)
+        val url = official("/kcs2/resources/ship/a.png")
+
+        assertArrayEquals(byteArrayOf(1), engine.fetch(url)?.bytes)
+        assertEquals(0, engine.entries().size)
+
+        assertArrayEquals(byteArrayOf(1), engine.fetch(url, routeNamespace = "kanxy:1043")?.bytes)
+        assertEquals(1, engine.entries().size)
+        assertEquals(2, fetcher.calls.get())
+    }
+
+    @Test
+    fun `route namespace serves the second request from disk without network`() {
+        val stored = result(byteArrayOf(2)).copy(headers = mapOf(
+            "Content-Type" to "image/png",
+            "Content-Length" to "1",
+            "Cache-Control" to "no-store, no-cache, must-revalidate, max-age=0",
+        ))
+        val fetcher = QueueFetcher(stored, null)
+        val engine = engine(fetcher)
+        val url = official("/kcs2/resources/ship/a.png")
+        val namespace = "kanxy:1043"
+
+        engine.fetch(url, routeNamespace = namespace)
+        val cached = engine.fetch(url, routeNamespace = namespace)
+
+        assertEquals(GameResourceResponseSource.CACHE, cached?.source)
+        assertArrayEquals(byteArrayOf(2), cached?.bytes)
+        assertEquals(1, fetcher.calls.get())
+    }
+
+    @Test
+    fun `route namespace never stores bootstrap files`() {
+        val fetcher = QueueFetcher(result(byteArrayOf(1)), result(byteArrayOf(2)))
+        val engine = engine(fetcher)
+        val namespace = "kanxy:1043"
+
+        assertNull(engine.fetch(official("/kcs2/js/main.js"), routeNamespace = namespace))
+        assertNull(engine.fetch(official("/kcs2/index.html"), routeNamespace = namespace))
+        assertNull(engine.fetch(official("/kcs2/version.json"), routeNamespace = namespace))
+        assertEquals(0, engine.entries().size)
+        assertEquals(0, fetcher.calls.get())
+    }
+
+    @Test
+    fun `stock and route entries stay separate for the same url`() {
+        val fetcher = QueueFetcher(result(byteArrayOf(1)), result(byteArrayOf(2)))
+        val engine = engine(fetcher)
+        val url = official("/kcs2/resources/ship/a.png")
+        val namespace = "kanxy:1043"
+
+        engine.fetch(url)
+        engine.fetch(url, routeNamespace = namespace)
+
+        assertArrayEquals(byteArrayOf(1), engine.fetch(url)?.bytes)
+        assertArrayEquals(byteArrayOf(2), engine.fetch(url, routeNamespace = namespace)?.bytes)
+        assertEquals(2, fetcher.calls.get())
+        assertEquals(2, engine.entries().size)
+    }
+
+    @Test
+    fun `a different route namespace misses the previous entries`() {
+        val fetcher = QueueFetcher(result(byteArrayOf(1)), result(byteArrayOf(2)))
+        val engine = engine(fetcher)
+        val url = official("/kcs2/resources/ship/a.png")
+
+        engine.fetch(url, routeNamespace = "kanxy:1043")
+        val next = engine.fetch(url, routeNamespace = "kanxy:1044")
+
+        assertEquals(GameResourceResponseSource.NETWORK, next?.source)
+        assertArrayEquals(byteArrayOf(2), next?.bytes)
+        assertEquals(2, fetcher.calls.get())
+    }
+
+    @Test
+    fun `route entry survives a failed revalidation after the route ttl`() {
+        var now = 1L
+        val stored = result(byteArrayOf(7)).copy(headers = mapOf(
+            "Content-Type" to "image/png",
+            "Content-Length" to "1",
+            "ETag" to "\"a\"",
+        ))
+        val fetcher = QueueFetcher(stored, null)
+        val engine = engine(fetcher, clock = { now })
+        val url = official("/kcs2/resources/ship/a.png")
+        val namespace = "kanxy:1043"
+
+        engine.fetch(url, routeNamespace = namespace)
+        now += GameResourceCacheEngine.ROUTE_TTL_MS + 1
+        val stale = engine.fetch(url, routeNamespace = namespace)
+
+        assertEquals(GameResourceResponseSource.CACHE, stale?.source)
+        assertArrayEquals(byteArrayOf(7), stale?.bytes)
+        assertEquals(2, fetcher.calls.get())
+    }
+
+    @Test
+    fun `route namespace reuses an entry across different request headers`() {
+        val stored = result(byteArrayOf(3)).copy(headers = mapOf(
+            "Content-Type" to "application/json",
+            "Content-Length" to "1",
+        ))
+        val fetcher = QueueFetcher(stored, null)
+        val engine = engine(fetcher)
+        val url = official("/kcs2/img/sally/sally_top.json")
+        val namespace = "kanxy:1090"
+
+        engine.fetch(
+            url,
+            mapOf("Referer" to "https://w17k.kancolle-server.com/kcs2/index.html"),
+            routeNamespace = namespace,
+        )
+        val cached = engine.fetch(
+            url,
+            mapOf("Referer" to "https://w17k.kancolle-server.com/kcs2/hc.html"),
+            routeNamespace = namespace,
+        )
+
+        assertEquals(GameResourceResponseSource.CACHE, cached?.source)
+        assertArrayEquals(byteArrayOf(3), cached?.bytes)
+        assertEquals(1, fetcher.calls.get())
+    }
+
+    @Test
+    fun `committed entries survive a store restart`() {
+        val root = temporaryFolder.newFolder()
+        val indexFile = root.resolve("index.json")
+        val url = official("/kcs2/resources/ship/a.png")
+        val key = checkNotNull(GameResourceCacheKey.from(url))
+        GameResourceCacheStore(root, GameResourceCacheIndex(indexFile), 10_000, { 1L })
+            .commit(key, byteArrayOf(1, 2), mimeType = "image/png")
+
+        val reopened = GameResourceCacheStore(root, GameResourceCacheIndex(indexFile), 10_000, { 1L })
+
+        assertNotNull(reopened.readFile(key))
+    }
+
+    @Test
+    fun `route namespace ignores the version query for the same path`() {
+        val stored = result(byteArrayOf(4)).copy(headers = mapOf(
+            "Content-Type" to "image/png",
+            "Content-Length" to "1",
+        ))
+        val fetcher = QueueFetcher(stored, null)
+        val engine = engine(fetcher)
+        val namespace = "kanxy:vpn:1107"
+        val banner = official("/kcs2/resources/ship/banner/0131_4153.png")
+
+        engine.fetch("$banner?version=78", routeNamespace = namespace)
+        val cached = engine.fetch("$banner?version=99-yahagi-mwo8h0zj", routeNamespace = namespace)
+
+        assertEquals(GameResourceResponseSource.CACHE, cached?.source)
+        assertArrayEquals(byteArrayOf(4), cached?.bytes)
+        assertEquals(1, fetcher.calls.get())
     }
 
     private fun engine(

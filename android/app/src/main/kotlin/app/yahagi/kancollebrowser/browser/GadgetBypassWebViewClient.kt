@@ -1,4 +1,4 @@
-package app.yahagi.kancollebrowser.browser
+﻿package app.yahagi.kancollebrowser.browser
 
 import android.annotation.SuppressLint
 import android.graphics.Bitmap
@@ -43,6 +43,7 @@ class GadgetBypassWebViewClient(
     val ownerToken: Any? = null,
     private val onDocumentStarted: (WebView?) -> Unit = {},
     private val useFreshGameResources: () -> Boolean = { false },
+    private val kanxyRouteNamespace: () -> String? = { null },
     private val needsKanxyScriptFallback: (WebView) -> Boolean = { false },
     private val isKanxyDiagnosticsEnabled: () -> Boolean = { false },
     private val onKanxyMainScript: (KanxyDiagnosticStatus) -> Unit = {},
@@ -75,6 +76,7 @@ class GadgetBypassWebViewClient(
         request: WebResourceRequest,
     ): WebResourceResponse? {
         val url = request.url?.toString() ?: return null
+
         return interceptResources(view, url, request.method, request.requestHeaders, request)
             ?: original.shouldInterceptRequest(view, request)
     }
@@ -103,9 +105,15 @@ class GadgetBypassWebViewClient(
             serveFromGameCache(
                 url, headers, method, kanxy = true,
                 traceMainScript = traceMainScript, rewriteMainScript = rewriteMainScript,
+                routeNamespace = kanxyNamespace(),
             ) {
                 needsKanxyScriptFallback(view)
             }?.let { return it }
+            // Only a kancolle URL should ever fall through; anything else is expected.
+            if (url.contains("kancolle-server.com")) {
+                val diagPath = runCatching { URI(url).rawPath }.getOrNull() ?: "?"
+                Log.d(TAG, "kanxy bypass $diagPath headers=${headers.keys.sorted()}")
+            }
             if (traceMainScript) recordKanxyMainScript(KanxyDiagnosticStatus.MAIN_SCRIPT_WEBVIEW_FALLBACK)
         }
         if (isEnabled() && GadgetBypassRules.shouldIntercept(url, method)) return serveFromBypass(url)
@@ -140,6 +148,7 @@ class GadgetBypassWebViewClient(
         kanxy: Boolean,
         traceMainScript: Boolean = false,
         rewriteMainScript: Boolean = false,
+        routeNamespace: String? = null,
         needsBridgePrefix: () -> Boolean = { false },
     ): WebResourceResponse? {
         if (kanxy && !GameResourceCacheRules.shouldCache(url, method)) return null
@@ -160,14 +169,27 @@ class GadgetBypassWebViewClient(
                 }
                 GameResourceCacheRules.withFallbackCookie(requestHeaders, cookie)
             }
-            // Let Kanxy serve fresh bytes without reading or updating the stock cache.
-            val response = if (kanxy) gameResourceEngine?.fetchFresh(url, cacheHeaders, method)
-                else gameResourceEngine?.fetch(url, cacheHeaders, method = method)
+            // A Kanxy route caches the bytes it produced, in its own namespace, so the
+            // injection travels with the cached body. Bootstrap files that must be fresh
+            // on every load stay on the network path.
+            val response = when {
+                !kanxy -> gameResourceEngine?.fetch(url, cacheHeaders, method = method)
+                routeNamespace == null || GameResourceCacheRules.isAlwaysValidated(url) ->
+                    gameResourceEngine?.fetchFresh(url, cacheHeaders, method)
+                else -> gameResourceEngine?.fetch(
+                    url, cacheHeaders, method = method, routeNamespace = routeNamespace,
+                )
+            }
             val elapsedMs = SystemClock.elapsedRealtime() - startedAt
+            // Route and source are the two facts needed to tell "served locally" from
+            // "resolved upstream through Kanxy" while diagnosing a chained session.
+            val route = routeNamespace ?: "stock"
             if (elapsedMs >= SLOW_CACHE_REQUEST_MS) {
-                Log.w(TAG, "resource cache ${response?.source ?: "fallback"} took ${elapsedMs}ms for $path")
+                Log.w(TAG, "resource cache ${response?.source ?: "fallback"} took ${elapsedMs}ms for $path route=$route")
             } else if (response?.source == GameResourceResponseSource.NETWORK) {
-                Log.d(TAG, "resource cache NETWORK took ${elapsedMs}ms for $path")
+                Log.d(TAG, "resource cache NETWORK took ${elapsedMs}ms for $path route=$route")
+            } else if (response?.source == GameResourceResponseSource.CACHE) {
+                Log.d(TAG, "resource cache CACHE took ${elapsedMs}ms for $path route=$route")
             }
             if (response == null) return null
             val plainScript = (rewriteMainScript || traceMainScript) && response.isPlainJavaScriptResponse()
@@ -243,6 +265,9 @@ class GadgetBypassWebViewClient(
             }
         }
     }
+
+    private fun kanxyNamespace(): String? =
+        runCatching(kanxyRouteNamespace).getOrNull()?.takeIf { it.isNotEmpty() }
 
     private fun kanxyDiagnosticsEnabled(): Boolean = runCatching(isKanxyDiagnosticsEnabled).getOrDefault(false)
 
@@ -442,3 +467,5 @@ internal class KanxyMainScriptInputStream(
         runCatching { onStatus(status) }
     }
 }
+
+

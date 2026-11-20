@@ -1,10 +1,11 @@
-﻿package app.yahagi.kancollebrowser.browser
+package app.yahagi.kancollebrowser.browser
 
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import androidx.webkit.ProxyConfig
 import androidx.webkit.ProxyController
 import androidx.webkit.WebViewFeature
@@ -119,6 +120,9 @@ class WebViewProxyManager(
                     "success" to success, "code" to code, "message" to message,
                     "elapsedMs" to (System.currentTimeMillis() - startTime),
                 ))
+                // Whether the process-wide override is actually installed decides if a
+                // chained session reaches the local proxy at all.
+                Log.i("YahagiProxy", "proxy=${proxyUrl ?: "none"} code=$code effective=${currentNativeProxy()}")
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {

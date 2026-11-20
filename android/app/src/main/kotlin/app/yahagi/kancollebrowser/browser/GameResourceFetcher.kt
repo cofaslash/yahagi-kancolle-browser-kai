@@ -202,8 +202,10 @@ class HttpUrlConnectionGameResourceFetcher(
         const val MAX_RESOURCE_BYTES = 16L * 1024L * 1024L
         private const val MAX_REDIRECTS = 5
         private val REDIRECT_CODES = setOf(301, 302, 303, 307, 308)
-        private val downloads = ThreadPoolExecutor(2, 2, 30, TimeUnit.SECONDS,
-            ArrayBlockingQueue(4), { task -> Thread(task, "game-resource-download").apply { isDaemon = true } },
+        // Keep up with the burst a screen entry produces; rejected tasks are re-fetched by
+        // the WebView, which bypasses the resource cache.
+        private val downloads = ThreadPoolExecutor(6, 6, 30, TimeUnit.SECONDS,
+            ArrayBlockingQueue(32), { task -> Thread(task, "game-resource-download").apply { isDaemon = true } },
             ThreadPoolExecutor.AbortPolicy())
 
         internal fun downloadToTemporaryFile(

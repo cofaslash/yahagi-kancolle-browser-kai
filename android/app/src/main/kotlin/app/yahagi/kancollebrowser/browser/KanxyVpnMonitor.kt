@@ -14,8 +14,12 @@ import androidx.annotation.MainThread
 
 private val kanxyPackages = listOf("com.axis000.kanxy", "com.kanxy.android")
 
+/** The installed, enabled Kanxy package whose rewrite output a cache namespace describes. */
+internal fun enabledKanxyPackageName(isPackageEnabled: (String) -> Boolean): String? =
+    kanxyPackages.firstOrNull(isPackageEnabled)
+
 internal fun hasEnabledKanxyPackage(isPackageEnabled: (String) -> Boolean): Boolean =
-    kanxyPackages.any(isPackageEnabled)
+    enabledKanxyPackageName(isPackageEnabled) != null
 
 @Suppress("DEPRECATION")
 internal fun PackageManager.hasEnabledKanxy(): Boolean = hasEnabledKanxyPackage { packageName ->

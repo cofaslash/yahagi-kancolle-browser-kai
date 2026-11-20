@@ -36,29 +36,6 @@ internal object GameModCoordinateScript {
           const nativeParse = JSON.parse;
           const kanxy = config.kanxy === true;
           if (kanxy) {
-            // PIXI can reuse Chromium's cached image before native interception.
-            // Keep the resource path intact so Yahagi's local replacements still win.
-            const imageProto = window.HTMLImageElement?.prototype;
-            const src = imageProto && Object.getOwnPropertyDescriptor(imageProto, 'src');
-            const documentVersion = 'yahagi-' + Date.now().toString(36) + Math.random().toString(36).slice(2);
-            const origin = new URL(location.href).origin;
-            const shipArtPath = /^\/kcs2\/resources\/ship\/[a-z0-9_]+\/[A-Za-z0-9_-]+\.png$/;
-            if (src?.configurable && src.set) {
-              Object.defineProperty(imageProto, 'src', {...src, set(value) {
-                let target = value;
-                if (typeof value === 'string') {
-                  try {
-                    const url = new URL(value, window.document?.baseURI || location.href);
-                    if (url.origin === origin && !url.username && !url.password && !url.hash &&
-                        shipArtPath.test(url.pathname) && (!url.search || /^\?version=[A-Za-z0-9._~-]+$/.test(url.search))) {
-                      url.search = (url.search ? url.search + '-' : '?version=') + documentVersion;
-                      target = url.href;
-                    }
-                  } catch (_) {}
-                }
-                src.set.call(this, target);
-              }});
-            }
           }
           const localArtShips = new Set(config.localArtShips || []);
           const externalCoordinates = new Map();

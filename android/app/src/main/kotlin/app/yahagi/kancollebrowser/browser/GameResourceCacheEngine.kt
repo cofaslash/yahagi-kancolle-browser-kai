@@ -1,4 +1,4 @@
-package app.yahagi.kancollebrowser.browser
+﻿package app.yahagi.kancollebrowser.browser
 
 import java.net.HttpURLConnection
 import java.net.URI
@@ -50,7 +50,9 @@ class GameResourceCacheEngine(
     private val modeProvider: () -> GameResourceCacheMode,
 ) {
     private val locks = Array(64) { ReentrantLock() }
-    private val downloadPermits = Semaphore(2)
+    // A screen entry requests a burst of assets at once. Two permits made the rest fall
+    // back to the WebView, which re-downloads them outside the cache on every visit.
+    private val downloadPermits = Semaphore(MAX_CONCURRENT_DOWNLOADS)
     private val legacyMigrationDone = AtomicBoolean(false)
     private val legacyMigrationLock = ReentrantLock()
 
@@ -105,6 +107,16 @@ class GameResourceCacheEngine(
         return fetched.toNetworkResponse(url, headers)
     }
 
+    /**
+     * Resolve through the stock cache, optionally partitioned by [routeNamespace].
+     *
+     * A non-null namespace marks a rewriting route (Kanxy): the stored bytes are the ones
+     * the route produced, so Kanxy injection stays inside the cached body. Such routes
+     * stamp `no-store, no-cache, must-revalidate, max-age=0` on every response to keep
+     * Blink from replaying it; that directive is ignored here because the persistent
+     * store is namespaced and revalidated on its own schedule. Responses that must be
+     * fresh on every load ([GameResourceCacheRules.isAlwaysValidated]) never enter it.
+     */
     fun fetch(
         url: String,
         requestHeaders: Map<String, String> = emptyMap(),
@@ -112,9 +124,14 @@ class GameResourceCacheEngine(
         expectedLength: Long? = null,
         shouldStore: () -> Boolean = { true },
         waitForSlot: Boolean = false,
+        routeNamespace: String? = null,
     ): GameResourceResponse? {
+        val routed = routeNamespace != null
+        if (routed && GameResourceCacheRules.isAlwaysValidated(url)) return null
         val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(fetcher.budgetMillis(url).coerceAtLeast(1))
-        val mode = modeProvider()
+        // A route resolves through its own cache unconditionally: the cached bytes are the
+        // route's output, so a mode switch must not silently drop back to the network.
+        val mode = if (routed) GameResourceCacheMode.LIGHT else modeProvider()
         if (!mode.readsCache || requestHeaders.size > 32 ||
             requestHeaders.any { (name, value) -> name.length > 128 || value.length > 8_192 } ||
             !GameResourceCacheRules.shouldCache(url, method) ||
@@ -125,7 +142,17 @@ class GameResourceCacheEngine(
             requestHeaders.value("Cache-Control").hasDirective("only-if-cached")
         ) return null
         if (!ensureLegacyMigration(deadlineNanos)) return null
-        val key = GameResourceCacheKey.from(url, requestHeaders) ?: return null
+        // A route namespace already isolates the bytes, and the route rewrites static assets
+        // per URL. Keying by request headers made every navigation (new Referer) miss, so the
+        // same frame JSON was re-downloaded on each screen. URL-only keys are safe inside the
+        // namespace; the stock path keeps its header variants.
+        val keyHeaders = if (routed) emptyMap() else requestHeaders
+        val key = GameResourceCacheKey.from(
+            url,
+            keyHeaders,
+            routeNamespace,
+            ignoreQuery = routed,
+        ) ?: return null
         val lock = locks[(key.hashCode() and Int.MAX_VALUE) % locks.size]
         if (!acquireWithinDeadline(lock, deadlineNanos)) return null
         try {
@@ -135,21 +162,27 @@ class GameResourceCacheEngine(
                 cached.entry.byteLength != expectedLength
             // Keep beta2's hot-cache behavior for reload headers and response no-cache.
             // Explicit must-revalidate, zero max-age, and bootstrap validation still apply.
-            val forceValidation =
-                cached?.entry?.responseHeaders?.value("Cache-Control").hasDirective("must-revalidate") ||
-                cached?.entry?.responseHeaders?.value("Cache-Control").hasDirective("max-age", "0")
+            // A rewriting route owns its own freshness window instead: its stamped
+            // directives describe the route, not the bytes it produced.
+            val forceValidation = !routed &&
+                (cached?.entry?.responseHeaders?.value("Cache-Control").hasDirective("must-revalidate") ||
+                    cached?.entry?.responseHeaders?.value("Cache-Control").hasDirective("max-age", "0"))
             val mustValidate = GameResourceCacheRules.isAlwaysValidated(url) ||
                 cachedLengthMismatch ||
                 forceValidation ||
                 (cached != null && cached.entry.version == null &&
-                    clock() - cached.entry.lastValidatedAt >= UNVERSIONED_TTL_MS)
+                    clock() - cached.entry.lastValidatedAt >= UNVERSIONED_TTL_MS) ||
+                (routed && cached != null &&
+                    clock() - cached.entry.lastValidatedAt >= ROUTE_TTL_MS)
             if (cached != null && !mustValidate) return cached.toResponse()
             val strictValidation = GameResourceCacheRules.requiresStrictValidation(url)
 
             val acquired = try {
                 val remaining = deadlineNanos - System.nanoTime()
                 remaining > 0 && if (waitForSlot) downloadPermits.tryAcquire(remaining, TimeUnit.NANOSECONDS)
-                    else downloadPermits.tryAcquire()
+                    // Let a burst wait briefly for a slot instead of dropping it to the
+                    // WebView fetch path, which cannot be cached and repeats on every visit.
+                    else downloadPermits.tryAcquire(SLOT_WAIT_MILLIS, TimeUnit.MILLISECONDS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
                 false
@@ -189,7 +222,7 @@ class GameResourceCacheEngine(
                 store.removeIfGeneration(key, storeGeneration)
                 return null
             }
-            val cacheableResponse = fetched.headers.isCacheableResponse()
+            val cacheableResponse = fetched.headers.isCacheableResponse(ignoreNoStore = routed)
             if (!cacheableResponse) store.removeIfGeneration(key, storeGeneration)
             val declaredLength = fetched.headers.value("Content-Length")?.toLongOrNull()
             if (fetched.bodyLength > HttpUrlConnectionGameResourceFetcher.MAX_RESOURCE_BYTES ||
@@ -357,12 +390,16 @@ class GameResourceCacheEngine(
     private fun Map<String, String>.value(name: String): String? =
         entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
 
-    private fun Map<String, String>.isCacheableResponse(): Boolean {
+    private fun Map<String, String>.isCacheableResponse(ignoreNoStore: Boolean = false): Boolean {
         if (value("Set-Cookie") != null || value("Set-Cookie2") != null ||
             value("Vary") != null
         ) return false
         val cacheControl = value("Cache-Control")
-        return !cacheControl.hasDirective("private") && !cacheControl.hasDirective("no-store")
+        // A rewriting route (Kanxy) stamps no-store on every response it serves, including
+        // unmodified static assets. Its namespace already separates the bytes, so the stamp
+        // describes the route rather than the payload and must not block persistence.
+        if (!ignoreNoStore && cacheControl.hasDirective("no-store")) return false
+        return !cacheControl.hasDirective("private")
     }
 
     private fun String?.hasDirective(name: String, value: String? = null): Boolean =
@@ -374,6 +411,19 @@ class GameResourceCacheEngine(
 
     companion object {
         const val UNVERSIONED_TTL_MS: Long = 6L * 60L * 60L * 1000L
+
+        /**
+         * Freshness window for a rewriting route (Kanxy). Matches the on-demand model the
+         * working reference client uses: serve the cached body immediately, revalidate only
+         * after a day. Route entries also never trigger a startup revalidation.
+         */
+        const val ROUTE_TTL_MS: Long = 24L * 60L * 60L * 1000L
+
+        /** How long a queued request waits for a download slot before yielding to the WebView. */
+        private const val SLOT_WAIT_MILLIS: Long = 750L
+
+        /** Simultaneous cache-filling downloads. A single screen entry can request dozens. */
+        internal const val MAX_CONCURRENT_DOWNLOADS: Int = 6
         private val HOP_BY_HOP_HEADERS = setOf(
             "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
             "te", "trailer", "transfer-encoding", "upgrade", "set-cookie",
@@ -398,3 +448,4 @@ data class GameResourceCacheStatus(
     val maxBytes: Long,
     val fileCount: Int,
 )
+

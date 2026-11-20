@@ -371,7 +371,8 @@ class AboutContentWidget extends StatelessWidget {
                   children: [
                     buildWebsiteButton(width: actionWidth),
                     buildGitHubButton(width: actionWidth),
-                    buildUpdateButton(width: actionWidth),
+                    if (releaseChecker != null)
+                      buildUpdateButton(width: actionWidth),
                   ],
                 );
 

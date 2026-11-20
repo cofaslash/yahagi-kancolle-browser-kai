@@ -73,6 +73,7 @@ import app.yahagi.kancollebrowser.browser.KanxyWebSocketObserver
 import app.yahagi.kancollebrowser.browser.KanxyWebViewCachePolicy
 import app.yahagi.kancollebrowser.browser.KanxyGameRouteState
 import app.yahagi.kancollebrowser.browser.KanxyResourceRoute
+import app.yahagi.kancollebrowser.browser.enabledKanxyPackageName
 import app.yahagi.kancollebrowser.browser.hasEnabledKanxy
 import app.yahagi.kancollebrowser.browser.isLoopbackHttpProxy
 import app.yahagi.kancollebrowser.capture.GameCaptureBridge
@@ -550,7 +551,7 @@ class MainActivity : FlutterActivity(), GadgetBypassManager.Host, DiagnosticExpo
                 },
                 temporaryDirectory = cacheDir.resolve("resource-downloads"),
             ),
-        ) { if (useFreshGameResources()) GameResourceCacheMode.NONE else gameResourceCacheMode }
+        ) { gameResourceCacheMode }
         gameResourceCacheEngine = resourceEngine
         val resourceNetworkMonitor = GameResourceNetworkMonitor(context)
         val resourceCoordinator = GameResourceDownloadCoordinator(
@@ -1290,7 +1291,11 @@ class MainActivity : FlutterActivity(), GadgetBypassManager.Host, DiagnosticExpo
         val manager = gadgetBypassManager ?: return
         if (!manager.enabled && gameResourceCacheMode == GameResourceCacheMode.NONE && gameModManager == null) return
 
-        val webView = gameAudioWebViews().singleOrNull() ?: return
+        // The native game host is authoritative. `singleOrNull()` returns null while a
+        // retiring Flutter WebView is still attached, which silently skipped the wrapper and
+        // left the game without resource interception.
+        val webView = nativeGameWebViewHost?.currentWebView?.takeIf { it.isAttachedToWindow }
+            ?: gameAudioWebViews().singleOrNull() ?: return
 
         val current = WebViewCompat.getWebViewClient(webView)
         if (current is GadgetBypassWebViewClient && current.ownerToken === gadgetBypassClientOwner) return
@@ -1323,6 +1328,7 @@ class MainActivity : FlutterActivity(), GadgetBypassManager.Host, DiagnosticExpo
                 cookiesIncludedInRequestHeaders = cookieInterceptSupported,
                 modResourceInterceptor = { url, method, headers -> gameModManager?.intercept(url, method, headers) },
                 useFreshGameResources = ::useFreshGameResources,
+                kanxyRouteNamespace = ::kanxyRouteNamespace,
                 needsKanxyScriptFallback = { view -> kanxyWebSocketObserver?.needsScriptFallback(view) == true },
                 isKanxyDiagnosticsEnabled = { kanxyDiagnosticChannel?.recording == true },
                 onKanxyMainScript = { status -> kanxyDiagnosticChannel?.record(status) },
@@ -1337,6 +1343,13 @@ class MainActivity : FlutterActivity(), GadgetBypassManager.Host, DiagnosticExpo
                     }
                 },
             ),
+        )
+        // The route can become active before this WebView exists, so the policy is also
+        // applied at installation; otherwise Blink keeps serving its own copies and the
+        // route cache never sees a request.
+        kanxyWebViewCache.update(
+            webView.takeIf { useFreshGameResources() },
+            kanxyResourceRoute,
         )
     }
 
@@ -1437,8 +1450,34 @@ class MainActivity : FlutterActivity(), GadgetBypassManager.Host, DiagnosticExpo
 
     private fun isKanxyResourceRouteActive(): Boolean = kanxyResourceRoute != null
 
-    private fun useFreshGameResources(): Boolean =
-        isKanxyResourceRouteActive() || kanxyHttpProxyConfigured
+    /**
+     * Kanxy is used for traffic processing, not for tunnelling: the app keeps Kanxy's VPN
+     * active and resolves every request through it. A per-app HTTP proxy hop is not part of
+     * the route any more, so the processed bytes and the cache always agree.
+     */
+    private fun useFreshGameResources(): Boolean = isKanxyVpnActive()
+
+    /**
+     * Cache namespace for bytes resolved through the active Kanxy route. The route rewrites
+     * response bodies without changing their URLs, so its output must never share entries
+     * with the stock cache; the package version bump invalidates them after a Kanxy update.
+     */
+    private fun kanxyRouteNamespace(): String? {
+        if (!useFreshGameResources()) return null
+        val packageName = enabledKanxyPackageName { name ->
+            try {
+                packageManager.getApplicationInfo(name, 0).enabled
+            } catch (_: PackageManager.NameNotFoundException) {
+                false
+            }
+        } ?: return null
+        val versionCode = try {
+            packageManager.getPackageInfo(packageName, 0).versionCode
+        } catch (_: PackageManager.NameNotFoundException) {
+            return null
+        }
+        return "kanxy:vpn:$versionCode"
+    }
 
     private fun kanxyRouteDiagnostic(): KanxyDiagnosticStatus {
         val route = kanxyResourceRoute ?: return KanxyDiagnosticStatus.ROUTE_INACTIVE
@@ -1447,25 +1486,19 @@ class MainActivity : FlutterActivity(), GadgetBypassManager.Host, DiagnosticExpo
 
     private fun updateKanxyResourceRoute(refreshVpn: Boolean = false): Boolean {
         val vpnActive = isKanxyVpnActive()
-        val proxy = if (vpnActive) null else webViewProxyManager?.currentNativeProxy()
-        val httpActive = proxy != null && proxy == verifiedKanxyHttpProxy
         val previous = kanxyResourceRoute
         val route = when {
-            !vpnActive && !httpActive -> null
-            previous != null && previous.proxy == proxy && !refreshVpn -> previous
-            else -> KanxyResourceRoute(proxy)
+            !vpnActive -> null
+            previous != null && previous.proxy == null && !refreshVpn -> previous
+            else -> KanxyResourceRoute(null)
         }
         kanxyResourceRoute = route
         val changed = previous !== route
-        // A loopback proxy may already serve modified bytes while identity is being checked.
-        shipPortraitChannel?.onRouteChanged(useFreshGameResources(), proxy, refresh = changed)
+        shipPortraitChannel?.onRouteChanged(useFreshGameResources(), null, refresh = changed)
         if (changed) {
             kanxyDiagnosticChannel?.record(kanxyRouteDiagnostic())
-            Log.i("YahagiKanxy", "Kanxy resource route active=${route != null} http=$httpActive")
+            Log.i("YahagiKanxy", "Kanxy resource route active=${route != null} via=vpn")
             configureKanxyWebView()
-            if (!vpnActive && (httpActive || previous?.proxy != null)) {
-                publishKanxyGameRoute(kanxyGameRoute.observeHttp(httpActive), http = true)
-            }
         }
         return changed
     }

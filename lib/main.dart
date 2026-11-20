@@ -662,7 +662,8 @@ Future<void> main() async {
       battleController.invalidateCaptureContinuity();
     },
   );
-  final releaseChecker = GitHubReleaseChecker();
+  // App update checking is disabled in this build.
+  final ReleaseChecker? releaseChecker = null;
   final gameMouseWheelSettingsController =
       await GameMouseWheelSettingsController.load();
   final shipSubtitleSettingsController =
