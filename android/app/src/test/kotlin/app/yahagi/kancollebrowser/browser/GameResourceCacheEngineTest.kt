@@ -1059,9 +1059,54 @@ class GameResourceCacheEngineTest {
         now += GameResourceCacheEngine.ROUTE_TTL_MS + 1
         val stale = engine.fetch(url, routeNamespace = namespace)
 
+        // The stale copy is served at once; the refresh runs off the request thread.
         assertEquals(GameResourceResponseSource.CACHE, stale?.source)
         assertArrayEquals(byteArrayOf(7), stale?.bytes)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (fetcher.calls.get() < 2 && System.nanoTime() < deadline) Thread.sleep(10)
         assertEquals(2, fetcher.calls.get())
+    }
+
+    @Test
+    fun `route entry is served immediately while the refresh is slow`() {
+        var now = 1L
+        val release = CountDownLatch(1)
+        val refreshEntered = CountDownLatch(1)
+        val calls = AtomicInteger()
+        val payload = result(byteArrayOf(9)).copy(headers = mapOf(
+            "Content-Type" to "image/png",
+            "Content-Length" to "1",
+        ))
+        val fetcher = object : GameResourceFetcher {
+            override fun budgetMillis(url: String) = 5_000L
+            override fun fetch(
+                url: String,
+                requestHeaders: Map<String, String>,
+                cached: GameResourceCacheEntry?,
+            ): GameResourceFetchResult? {
+                if (calls.incrementAndGet() > 1) {
+                    refreshEntered.countDown()
+                    release.await(5, TimeUnit.SECONDS)
+                }
+                return payload
+            }
+        }
+        val engine = engine(fetcher, clock = { now })
+        val url = official("/kcs2/resources/ship/b.png")
+        val namespace = "kanxy:1043"
+
+        engine.fetch(url, routeNamespace = namespace)
+        now += GameResourceCacheEngine.ROUTE_TTL_MS + 1
+
+        val startedAt = System.nanoTime()
+        val served = engine.fetch(url, routeNamespace = namespace)
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+
+        assertEquals(GameResourceResponseSource.CACHE, served?.source)
+        assertArrayEquals(byteArrayOf(9), served?.bytes)
+        assertTrue("serving took ${elapsedMs}ms", elapsedMs < 1_000)
+        assertTrue(refreshEntered.await(3, TimeUnit.SECONDS))
+        release.countDown()
     }
 
     @Test
