@@ -6,9 +6,6 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FilterInputStream
 import java.io.InputStream
-import java.util.concurrent.ArrayBlockingQueue
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
@@ -57,34 +54,6 @@ class GameResourceCacheEngine(
     // back to the WebView, which re-downloads them outside the cache on every visit.
     private val downloadPermits = Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-    // Stale-while-revalidate: a TTL expiry must never block the WebView thread. The cached
-    // body is served at once and one background refresh per key is scheduled.
-    private val refreshKeys = ConcurrentHashMap.newKeySet<GameResourceCacheKey>()
-    private val refreshes = ThreadPoolExecutor(
-        2, 2, 30, TimeUnit.SECONDS, ArrayBlockingQueue(16),
-        { runnable -> Thread(runnable, "game-resource-revalidate").apply { isDaemon = true } },
-        ThreadPoolExecutor.DiscardPolicy(),
-    )
-    private fun scheduleRefresh(
-        key: GameResourceCacheKey,
-        url: String,
-        requestHeaders: Map<String, String>,
-        method: String,
-        routeNamespace: String?,
-    ) {
-        if (!refreshKeys.add(key)) return
-        refreshes.execute {
-            try {
-                fetch(
-                    url, requestHeaders, method,
-                    routeNamespace = routeNamespace, forceRefresh = true,
-                )
-            } catch (_: Throwable) {
-            } finally {
-                refreshKeys.remove(key)
-            }
-        }
-    }
     private val legacyMigrationDone = AtomicBoolean(false)
     private val legacyMigrationLock = ReentrantLock()
 
@@ -157,7 +126,6 @@ class GameResourceCacheEngine(
         shouldStore: () -> Boolean = { true },
         waitForSlot: Boolean = false,
         routeNamespace: String? = null,
-        forceRefresh: Boolean = false,
     ): GameResourceResponse? {
         val routed = routeNamespace != null
         if (routed && GameResourceCacheRules.isAlwaysValidated(url)) return null
@@ -201,25 +169,17 @@ class GameResourceCacheEngine(
                 (cached?.entry?.responseHeaders?.value("Cache-Control").hasDirective("must-revalidate") ||
                     cached?.entry?.responseHeaders?.value("Cache-Control").hasDirective("max-age", "0"))
             val strictValidation = GameResourceCacheRules.requiresStrictValidation(url)
-            val ttlExpired = cached != null && (
-                (cached.entry.version == null &&
-                    clock() - cached.entry.lastValidatedAt >= UNVERSIONED_TTL_MS) ||
-                    (routed && clock() - cached.entry.lastValidatedAt >= ROUTE_TTL_MS)
-                )
+            // A route entry never expires by time: the route namespace already changes with
+            // the Kanxy version, and the user clears the cache after a game update. Stock
+            // entries keep their unversioned window.
+            val ttlExpired = !routed && cached != null &&
+                cached.entry.version == null &&
+                clock() - cached.entry.lastValidatedAt >= UNVERSIONED_TTL_MS
             val mustValidate = GameResourceCacheRules.isAlwaysValidated(url) ||
                 cachedLengthMismatch ||
                 forceValidation ||
                 ttlExpired
             if (cached != null && !mustValidate) return cached.toResponse()
-            // A route entry past its window is still good enough to render: serve it and
-            // refresh in the background, so one slow upstream request cannot stall a whole
-            // screen of banners.
-            if (cached != null && routed && !forceRefresh && ttlExpired &&
-                !cachedLengthMismatch && !forceValidation && !strictValidation
-            ) {
-                scheduleRefresh(key, url, requestHeaders, method, routeNamespace)
-                return cached.toResponse()
-            }
 
             val acquired = try {
                 val remaining = deadlineNanos - System.nanoTime()
@@ -456,12 +416,6 @@ class GameResourceCacheEngine(
     companion object {
         const val UNVERSIONED_TTL_MS: Long = 6L * 60L * 60L * 1000L
 
-        /**
-         * Freshness window for a rewriting route (Kanxy). Matches the on-demand model the
-         * working reference client uses: serve the cached body immediately, revalidate only
-         * after a day. Route entries also never trigger a startup revalidation.
-         */
-        const val ROUTE_TTL_MS: Long = 24L * 60L * 60L * 1000L
 
         /** How long a queued request waits for a download slot before yielding to the WebView. */
         private const val SLOT_WAIT_MILLIS: Long = 750L
